@@ -13,6 +13,8 @@ IFS=',' read -ra train_devices <<< "$CUDA_VISIBLE_DEVICES"
 NGPUS_PER_NODE=${#train_devices[@]}
 ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-4}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
+PPO_TOKEN_BUDGET="${PPO_TOKEN_BUDGET:-4096}"
+ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-8}"
 if (( NGPUS_PER_NODE % ROLLOUT_TP_SIZE != 0 || (TRAIN_BATCH_SIZE * 2) % NGPUS_PER_NODE != 0 )); then
     echo 'GPU count must divide batch_size * rollout_n and be divisible by rollout TP size.' >&2
     exit 1
@@ -100,13 +102,7 @@ else
 fi
 PROJ_DIR=${PROJ_ROOT}/${EXP}
 require_file "$MODEL_PATH/config.json"
-# The copied raw data and split IDs are ready; compute real MiniLM retrieval on
-# the server once the local models are present. Never replace existing Parquet.
-if [[ ! -f "$TRAIN_PATH" && ! -f "$VAL_PATH" &&
-      "$TRAIN_PATH" == "$DATASET_ROOT/RAG_top10_32k_train.parquet" &&
-      "$VAL_PATH" == "$DATASET_ROOT/RAG_top10_32k_test.parquet" ]]; then
-    CUDA_VISIBLE_DEVICES="${PREPARE_GPU:-0}" python scripts/prepare_personamem.py
-fi
+# Use prepared training/evaluation Parquet files from the upstream workflow.
 require_file "$TRAIN_PATH"
 require_file "$VAL_PATH"
 python scripts/check_model_service.py --judge
@@ -115,7 +111,24 @@ if [[ -n "${GUIDELINE_PATH:-}" ]]; then
     require_file "$GUIDELINE_PATH"
     GUIDELINE_ARGS+=("recurrent.memory.config.guideline_path='$GUIDELINE_PATH'")
 fi
-MAX_CHUNKS="${MAX_CHUNKS:-$(python scripts/prepare_personamem.py --recommended-max-chunks "$DATASET_ROOT/preparation_manifest.json")}"
+# Infer runtime context capacity from prepared inputs without a preprocessing manifest.
+if [[ -z "${MAX_CHUNKS:-}" ]]; then
+    MAX_CHUNKS="$(python - "$MODEL_PATH" "$TRAIN_PATH" "$VAL_PATH" <<'PY'
+import math
+import sys
+import pyarrow.parquet as pq
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained(sys.argv[1], local_files_only=True)
+max_tokens = 0
+for path in sys.argv[2:]:
+    for block in pq.ParquetFile(path).iter_batches(columns=["context"], batch_size=128):
+        for context in block.column(0).to_pylist():
+            max_tokens = max(max_tokens, len(tokenizer.encode(context, add_special_tokens=False)))
+print(max(8, math.ceil(max_tokens / 512)))
+PY
+)"
+fi
 
 # Please note that recurrent framewrok will use max_length defined in task config.
 # These two values are just for vLLM to decide max_model_length.
@@ -180,9 +193,9 @@ exec python -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size="$TRAIN_BATCH_SIZE" \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192 \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$PPO_TOKEN_BUDGET" \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="$PPO_TOKEN_BUDGET" \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$PPO_TOKEN_BUDGET" \
     actor_rollout_ref.rollout.dtype=bfloat16 \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.use_kl_loss=True \
@@ -204,6 +217,7 @@ exec python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
     actor_rollout_ref.rollout.max_model_len=8192 \
     actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
+    actor_rollout_ref.rollout.max_num_seqs="$ROLLOUT_MAX_NUM_SEQS" \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.critic_warmup=0 \
@@ -212,8 +226,8 @@ exec python -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=$NGPUS_PER_NODE \
     trainer.nnodes=$NNODES \
-    trainer.test_freq=50 \
-    trainer.test_start_step=100 \
+    trainer.test_freq=-1 \
+    trainer.val_at_end=True \
     trainer.default_hdfs_dir=null \
     "trainer.default_local_dir='$PROJ_DIR'" \
     trainer.total_epochs=5 \

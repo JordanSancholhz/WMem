@@ -33,6 +33,7 @@ import torch
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, RandomSampler, SequentialSampler
+from verl.utils.dataset.tail_batch_sampler import TailMergeBatchSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
@@ -517,12 +518,6 @@ class RayPPOTrainer:
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
 
-        self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
-                                                   batch_size=self.config.data.train_batch_size,
-                                                   num_workers=8,
-                                                   drop_last=True,
-                                                   collate_fn=collate_fn,
-                                                   sampler=sampler)
         if self.config.recurrent.enable:
             self.val_dataset = self.recurrent_register.dataset_cls(
                 recurrent_config=self.recurrent_config,
@@ -548,11 +543,11 @@ class RayPPOTrainer:
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            batch_sampler=TailMergeBatchSampler(
+                sampler, self.config.data.get("gen_batch_size") or self.config.data.train_batch_size
+            ),
             num_workers=8,
-            drop_last=True,
             collate_fn=collate_fn,
-            sampler=sampler,
         )
 
         self.val_dataloader = StatefulDataLoader(
@@ -1150,6 +1145,14 @@ class RayPPOTrainer:
                 prediction_batch = None
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                metrics["training/questions_in_batch"] = len(batch)
+                # Keep the configured optimizer-step count even for a merged tail.
+                # Recurrent actor td_split consumes ALL rows; dynamic microbatches
+                # accumulate their losses before the single default optimizer step.
+                metrics["training/optimizer_minibatches"] = (
+                    self.config.data.train_batch_size
+                    // self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                )
                 # pop those keys for generation
                 if "multi_modal_inputs" in batch.non_tensor_batch.keys():
                     gen_batch = batch.pop(
@@ -1646,13 +1649,17 @@ class RayPPOTrainer:
                         with _timer("save_checkpoint", timing_raw):
                             self._save_checkpoint()
 
-                    # Delay periodic validation, but always keep the final check.
-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (
-                        is_last_step or (
-                            self.global_steps >= getattr(self.config.trainer, "test_start_step", 0)
-                            and self.global_steps % self.config.trainer.test_freq == 0
-                        )
-                    ):
+                    # The public WMem run evaluates only the final saved model.
+                    # Other callers may still opt into periodic validation.
+                    periodic_validation = (
+                        self.config.trainer.test_freq > 0
+                        and self.global_steps >= self.config.trainer.get("test_start_step", 0)
+                        and self.global_steps % self.config.trainer.test_freq == 0
+                    )
+                    final_validation = (
+                        is_last_step and self.config.trainer.get("val_at_end", True)
+                    )
+                    if self.val_reward_fn is not None and (final_validation or periodic_validation):
                         with _timer("testing", timing_raw):
                             val_metrics: dict = self._validate(phase="final" if is_last_step else "periodic")
                             pprint("######################################################")
