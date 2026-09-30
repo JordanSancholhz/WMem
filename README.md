@@ -21,7 +21,7 @@ This repository contains the training implementation of **WMem**, a recurrent me
 Long interaction histories require language agents to continually update their memories while retaining information needed for future decisions. **WMem** trains a recurrent memory policy with **future memory-state prediction**, using predicted memory transitions to guide credit assignment during reinforcement learning.
 
 <div align="center">
-  <img src="picture/<Model1.png" alt="Logo" style="width:100%;">
+  <img src="picture/Model1.png" alt="Logo" style="width:100%;">
 </div>
 
 WMem combines three components:
