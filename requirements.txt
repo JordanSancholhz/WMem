@@ -1,0 +1,28 @@
+# Install a matching CUDA PyTorch, vLLM and flash-attn stack first.
+# This is a dependency list, not a recovered lockfile of the original experiment.
+accelerate
+aiohttp
+codetiming
+datasets
+dill
+einops
+hydra-core
+numpy
+omegaconf
+openai
+packaging
+pandas
+peft
+psutil
+pyarrow>=15.0.0
+PyYAML
+ray[default]
+requests
+sentence-transformers
+tensordict<=0.6.2
+torchdata
+tqdm
+transformers
+typing_extensions
+uvloop; sys_platform == 'linux'
+wandb

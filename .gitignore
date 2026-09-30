@@ -1,0 +1,35 @@
+# Models, datasets, generated artifacts and local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+models/
+sentence-transformers/
+MGI_module/datasets/
+checkpoints/
+memory_agent/
+outputs/
+output/
+results/
+prediction_audit/
+validation_metrics/
+plots/
+wandb/
+ray_results/
+*.log
+*.parquet
+*.pt
+*.pth
+*.safetensors
+*.backup_*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+build/
+dist/
+tmp/
+# README is reviewed separately and is deliberately not part of this upload.
+/README.md
