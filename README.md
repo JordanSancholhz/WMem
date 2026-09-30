@@ -139,7 +139,9 @@ We follow the **Run Inference** section under **GMPO Inference** in [MemCoE](htt
 
 ## Hardware
 
-All experiments are conducted on a server equipped with 8 NVIDIA H200 GPUs
+```text
+All experiments are conducted on a server equipped with 4 NVIDIA H200 GPUs
+```
 
 ---
 
