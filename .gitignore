@@ -33,3 +33,6 @@ dist/
 tmp/
 # README is reviewed separately and is deliberately not part of this upload.
 /README.md
+
+# Regression tests are kept locally and excluded from the public release.
+/tests/
