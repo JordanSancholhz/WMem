@@ -33,7 +33,6 @@ import torch
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, RandomSampler, SequentialSampler
-from verl.utils.dataset.tail_batch_sampler import TailMergeBatchSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
@@ -48,7 +47,6 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
-    process_validation_metrics,
     reduce_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
@@ -56,7 +54,6 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
-from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 
 WorkerType = Type[Worker]
@@ -307,7 +304,6 @@ class RayPPOTrainer:
         ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
         processor=None,
         reward_fn=None,
-        val_reward_fn=None,
     ):
         # assert torch.cuda.is_available(), 'cuda must be available on driver'
 
@@ -315,7 +311,6 @@ class RayPPOTrainer:
         self.processor = processor
         self.config = config
         self.reward_fn = reward_fn
-        self.val_reward_fn = val_reward_fn
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -328,7 +323,6 @@ class RayPPOTrainer:
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
-        self.validation_generations_logger = ValidationGenerationsLogger()
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -353,9 +347,8 @@ class RayPPOTrainer:
 
     def _validate_config(self):
         config = self.config
-        if self.reward_fn and self.val_reward_fn:
+        if self.reward_fn:
             self.reward_fn.trainer = self
-            self.val_reward_fn.trainer = self
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
@@ -453,14 +446,6 @@ class RayPPOTrainer:
             if config.critic.get("ulysses_sequence_parallel_size", 1) > 1:
                 assert config.critic.model.use_remove_padding, "When using sequence parallelism for critic, you must enable `use_remove_padding`."
 
-        if config.data.get("val_batch_size", None) is not None:
-            print("WARNING: val_batch_size is deprecated." + " Validation datasets are sent to inference engines as a whole batch," + " which will schedule the memory themselves.")
-
-        # check eval config
-        if config.actor_rollout_ref.rollout.val_kwargs.do_sample:
-            assert config.actor_rollout_ref.rollout.temperature > 0, \
-                "validation gen temperature should be greater than 0 when enabling do_sample"
-            
         # TODO: check consistency with implementation in `init_worker`
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
@@ -518,51 +503,23 @@ class RayPPOTrainer:
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
 
-        if self.config.recurrent.enable:
-            self.val_dataset = self.recurrent_register.dataset_cls(
-                recurrent_config=self.recurrent_config,
-                data_config=self.config.data,
-                data_files=self.config.data.val_files,
-                tokenizer=self.tokenizer,
-                processor=self.processor,
-            )
-        else:
-            dataset_cls: type[RLHFDataset] # important for static type checking
-            self.val_dataset = dataset_cls(
-                data_files=self.config.data.val_files,
-                tokenizer=self.tokenizer,
-                processor=self.processor,
-                config=self.config.data,
-            )
-        # consider the design of single controller with a large val dataset in multi-modal scenarios
-        # may lead to oom issues
-        val_batch_size = self.config.data.val_batch_size or len(self.val_dataset)
-        assert self.val_dataset.truncation == self.config.data.get(
-            'truncation', 'error'
-        ), f'dataset truncation {self.val_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
-
+        self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
+                                                   batch_size=self.config.data.train_batch_size,
+                                                   num_workers=8,
+                                                   drop_last=True,
+                                                   collate_fn=collate_fn,
+                                                   sampler=sampler)
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_sampler=TailMergeBatchSampler(
-                sampler, self.config.data.get("gen_batch_size") or self.config.data.train_batch_size
-            ),
+            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
             num_workers=8,
+            drop_last=True,
             collate_fn=collate_fn,
-        )
-
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=val_batch_size,
-            num_workers=8,
-            shuffle=False,
-            drop_last=False,
-            collate_fn=collate_fn,
+            sampler=sampler,
         )
 
         assert len(self.train_dataloader) >= 1
-        assert len(self.val_dataloader) >= 1
-
-        print(f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: {len(self.val_dataloader)}")
+        print(f"Size of train dataloader: {len(self.train_dataloader)}")
 
         # inject total_training_steps to actor/critic optim_config. This is hacky.
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -601,188 +558,6 @@ class RayPPOTrainer:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         print(f"Dumped generations to {filename}")
-
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
-        """Log a table of validation samples to the configured logger (wandb or swanlab)"""
-
-        generations_to_log = self.config.trainer.log_val_generations
-
-        if generations_to_log == 0:
-            return
-
-        import numpy as np
-
-        # Create tuples of (input, output, score) and sort by input text
-        samples = list(zip(inputs, outputs, scores))
-        samples.sort(key=lambda x: x[0])  # Sort by input text
-
-        # Use fixed random seed for deterministic shuffling
-        rng = np.random.RandomState(42)
-        rng.shuffle(samples)
-
-        # Take first N samples after shuffling
-        samples = samples[:generations_to_log]
-
-        # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
-
-    def _validate(self, phase="validation"):
-        data_source_lst = []
-        category_extra_infos = []
-        category_question_keys = []
-        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
-
-        # Lists to collect samples for the table
-        sample_inputs = []
-        sample_outputs = []
-        sample_scores = []
-        num_questions = 0
-
-        # Keep collection in the Ray controller. Do not gather full test-history
-        # objects with NCCL after ranks finish independently (straggler timeout).
-        for batch_index, test_data in enumerate(self.val_dataloader, start=1):
-            test_batch = DataProto.from_single_dict(test_data)
-            question_start = num_questions
-            num_questions += len(test_batch)
-            print(f"[Validation] step={self.global_steps} batch={batch_index}/{len(self.val_dataloader)} "
-                  f"questions={len(test_batch)} starting", flush=True)
-
-            # repeat test batch
-            test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
-            # Capture metadata before generation pops fields. Each original row
-            # has n adjacent responses; returned generation padding is removed.
-            category_extra_infos.extend(test_batch.non_tensor_batch.get("extra_info", [None] * len(test_batch)))
-            category_question_keys.extend(
-                key for key in range(question_start, num_questions)
-                for _ in range(self.config.actor_rollout_ref.rollout.val_kwargs.n)
-            )
-
-            # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-                return {}
-
-            # Store original inputs
-            if not self.config.recurrent.enable:
-                input_ids = test_batch.batch['input_ids']
-                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-                sample_inputs.extend(input_texts)
-            else:
-                ###### ADD
-                sample_inputs.extend(test_batch.non_tensor_batch['sample_uuid'])
-
-            ###### ADD
-            if self.config.recurrent.enable:
-                batch_keys_to_pop, non_tensor_batch_keys_to_pop = self.val_dataset.get_bactch_keys()
-            else:
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-            if "multi_modal_inputs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
-            if "raw_prompt" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
-            if "tools_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("tools_kwargs")
-            test_gen_batch = test_batch.pop(
-                batch_keys=batch_keys_to_pop,
-                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-            )
-
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-            }
-
-            print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
-            ######
-            # ADD: no need to padding. indexing is needed.
-            ######
-            if not self.config.recurrent.enable:
-                # pad to be divisible by dp_size
-                test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-                if not self.async_rollout_mode:
-                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-                else:
-                    # TODO: Maybe no more padding needed?
-                    self.async_rollout_manager.wake_up()
-                    test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
-                    self.async_rollout_manager.sleep()
-                # unpad
-                test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-            else:
-                from recurrent.utils import final_batch
-                output_gen_batch, final_mask, sample_index = self.generation_manager.run_llm_loop(test_gen_batch, {})
-                test_output_gen_batch = final_batch(output_gen_batch, final_mask, sample_index)
-
-            print('validation generation end')
-            
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
-
-            test_batch = test_batch.union(test_output_gen_batch)
-
-            # evaluate using reward_function
-            result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
-
-            reward_extra_infos_dict["reward"].extend(scores)
-            if "reward_extra_info" in result:
-                for key, lst in result["reward_extra_info"].items():
-                    reward_extra_infos_dict[key].extend(lst)
-
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
-            print(f"[Validation] step={self.global_steps} batch={batch_index}/{len(self.val_dataloader)} "
-                  f"completed; scored_responses={len(sample_scores)}", flush=True)
-
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
-
-        # dump generations
-        val_data_dir = self.config.trainer.get("validation_data_dir", None)
-        if val_data_dir:
-            self._dump_generations(
-                inputs=sample_inputs,
-                outputs=sample_outputs,
-                scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
-                dump_path=val_data_dir,
-            )
-
-        for key_info, lst in reward_extra_infos_dict.items():
-            assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
-
-        data_sources = np.concatenate(data_source_lst, axis=0)
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
-        metric_dict = {}
-        for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
-            for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                for metric_name, metric_val in metric2val.items():
-                    if (var_name == core_var) and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"]) and (f"@{n_max}" in metric_name):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
-
-        from verl.utils.validation_logging import personamem_category_metrics, save_validation_metrics
-        category_metrics, category_report = personamem_category_metrics(
-            data_sources, category_extra_infos, category_question_keys, sample_scores,
-        )
-        metric_dict.update(category_metrics)
-        save_validation_metrics(
-            self.config.trainer.get("default_local_dir", None),
-            step=self.global_steps, phase=phase, metrics=metric_dict,
-            num_questions=num_questions, num_responses=len(sample_scores),
-            personamem_categories=category_report,
-        )
-        return metric_dict
 
     def init_workers(self):
         """Init resource pool and worker group"""
@@ -1120,23 +895,11 @@ class RayPPOTrainer:
         # load checkpoint before doing anything
         self._load_checkpoint()
 
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            print("################### val_before_train #####################", flush=True)
-            val_metrics = self._validate(phase="before_train")
-            pprint("######################################################")
-            pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
-
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
         self.global_steps += 1
-        last_val_metrics = None
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1145,14 +908,6 @@ class RayPPOTrainer:
                 prediction_batch = None
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
-                metrics["training/questions_in_batch"] = len(batch)
-                # Keep the configured optimizer-step count even for a merged tail.
-                # Recurrent actor td_split consumes ALL rows; dynamic microbatches
-                # accumulate their losses before the single default optimizer step.
-                metrics["training/optimizer_minibatches"] = (
-                    self.config.data.train_batch_size
-                    // self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-                )
                 # pop those keys for generation
                 if "multi_modal_inputs" in batch.non_tensor_batch.keys():
                     gen_batch = batch.pop(
@@ -1221,23 +976,7 @@ class RayPPOTrainer:
                             # Also, just as what happened in validate, we will always set n=1 in generation_kwargs.
                             batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                             gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                            # Generate the regular questions first, then the merged tail,
-                            # without changing policy parameters between the two parts.
-                            from recurrent.batch_accumulation import run_segmented_rollout
-                            rollout_limit = (
-                                self.config.data.train_batch_size
-                                * self.config.actor_rollout_ref.rollout.n
-                            )
-                            gen_batch_output, final_mask, sample_index = run_segmented_rollout(
-                                self.generation_manager, gen_batch, timing_raw, rollout_limit
-                            )
-                            if len(gen_batch) > rollout_limit:
-                                gen_batch_output.batch["accumulation_segment"] = (
-                                    sample_index // rollout_limit
-                                )
-                                gen_batch_output.meta_info["accumulation_segments"] = (
-                                    (len(gen_batch) + rollout_limit - 1) // rollout_limit
-                                )
+                            gen_batch_output, final_mask, sample_index = self.generation_manager.run_llm_loop(gen_batch, timing_raw)
 
                             assert final_mask.sum().item() == len(batch.batch), \
                                 "The number of final responses should be equal to the number of prompts." \
@@ -1659,30 +1398,10 @@ class RayPPOTrainer:
                                 dump_path=rollout_data_dir,
                             )
 
-                    # Persist the completed update before potentially lengthy
-                    # validation, so a validation failure does not lose it.
+                    # Persist periodic and final training checkpoints.
                     if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with _timer("save_checkpoint", timing_raw):
                             self._save_checkpoint()
-
-                    # The public WMem run evaluates only the final saved model.
-                    # Other callers may still opt into periodic validation.
-                    periodic_validation = (
-                        self.config.trainer.test_freq > 0
-                        and self.global_steps >= self.config.trainer.get("test_start_step", 0)
-                        and self.global_steps % self.config.trainer.test_freq == 0
-                    )
-                    final_validation = (
-                        is_last_step and self.config.trainer.get("val_at_end", True)
-                    )
-                    if self.val_reward_fn is not None and (final_validation or periodic_validation):
-                        with _timer("testing", timing_raw):
-                            val_metrics: dict = self._validate(phase="final" if is_last_step else "periodic")
-                            pprint("######################################################")
-                            pprint(f"self.global_steps: {self.global_steps} validation metrics: {val_metrics}")
-                            if is_last_step:
-                                last_val_metrics = val_metrics
-                        metrics.update(val_metrics)
 
                 # training metrics
                 metrics.update(
@@ -1706,7 +1425,6 @@ class RayPPOTrainer:
 
                 if is_last_step:
                     pprint("######################################################")
-                    pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
 

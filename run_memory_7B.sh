@@ -13,8 +13,6 @@ IFS=',' read -ra train_devices <<< "$CUDA_VISIBLE_DEVICES"
 NGPUS_PER_NODE=${#train_devices[@]}
 ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-4}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
-PPO_TOKEN_BUDGET="${PPO_TOKEN_BUDGET:-4096}"
-ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-8}"
 if (( NGPUS_PER_NODE % ROLLOUT_TP_SIZE != 0 || (TRAIN_BATCH_SIZE * 2) % NGPUS_PER_NODE != 0 )); then
     echo 'GPU count must divide batch_size * rollout_n and be divisible by rollout TP size.' >&2
     exit 1
@@ -22,7 +20,6 @@ fi
 printf 'Training GPUs: %s; global batch: %s; rollout TP: %s; samples per question: 2\n' \
     "$CUDA_VISIBLE_DEVICES" "$TRAIN_BATCH_SIZE" "$ROLLOUT_TP_SIZE"
 
-VAL_PATH="${VAL_PATH:-${DATASET_ROOT}/RAG_top10_32k_test.parquet}"
 TRAIN_PATH="${TRAIN_PATH:-${DATASET_ROOT}/RAG_top10_32k_train.parquet}"
 FUTURE_PREDICTION_ENABLE="${FUTURE_PREDICTION_ENABLE:-True}"
 FUTURE_PREDICTION_MODE="${FUTURE_PREDICTION_MODE:-known_state}"
@@ -102,18 +99,15 @@ else
 fi
 PROJ_DIR=${PROJ_ROOT}/${EXP}
 require_file "$MODEL_PATH/config.json"
-# Use prepared training/evaluation Parquet files from the upstream workflow.
 require_file "$TRAIN_PATH"
-require_file "$VAL_PATH"
 python scripts/check_model_service.py --judge
 GUIDELINE_ARGS=()
 if [[ -n "${GUIDELINE_PATH:-}" ]]; then
     require_file "$GUIDELINE_PATH"
     GUIDELINE_ARGS+=("recurrent.memory.config.guideline_path='$GUIDELINE_PATH'")
 fi
-# Infer runtime context capacity from prepared inputs without a preprocessing manifest.
 if [[ -z "${MAX_CHUNKS:-}" ]]; then
-    MAX_CHUNKS="$(python - "$MODEL_PATH" "$TRAIN_PATH" "$VAL_PATH" <<'PY'
+    MAX_CHUNKS="$(python - "$MODEL_PATH" "$TRAIN_PATH" <<'PY'
 import math
 import sys
 import pyarrow.parquet as pq
@@ -121,10 +115,9 @@ from transformers import AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained(sys.argv[1], local_files_only=True)
 max_tokens = 0
-for path in sys.argv[2:]:
-    for block in pq.ParquetFile(path).iter_batches(columns=["context"], batch_size=128):
-        for context in block.column(0).to_pylist():
-            max_tokens = max(max_tokens, len(tokenizer.encode(context, add_special_tokens=False)))
+for block in pq.ParquetFile(sys.argv[2]).iter_batches(columns=["context"], batch_size=128):
+    for context in block.column(0).to_pylist():
+        max_tokens = max(max_tokens, len(tokenizer.encode(context, add_special_tokens=False)))
 print(max(8, math.ceil(max_tokens / 512)))
 PY
 )"
@@ -157,17 +150,14 @@ exec python -m verl.trainer.main_ppo \
     algorithm.grpo_use_adv=False \
     trainer.save_freq=40 \
     actor_rollout_ref.rollout.n=2 \
-    actor_rollout_ref.rollout.val_kwargs.n=4 \
     'trainer.logger=[console]' \
     actor_rollout_ref.actor.optim.lr_warmup_steps=20 \
     actor_rollout_ref.actor.clip_ratio_high=0.20 \
     actor_rollout_ref.actor.entropy_coeff=0.000 \
     "data.train_files=['$TRAIN_PATH']" \
-    "data.val_files=['$VAL_PATH']" \
     data.shuffle=True \
     data.filter_overlong_prompts=True \
     data.train_batch_size="$TRAIN_BATCH_SIZE" \
-    data.val_batch_size=24 \
     data.truncation='center' \
     +data.context_key='context' \
     data.max_prompt_length=$MAXLEN \
@@ -193,9 +183,9 @@ exec python -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size="$TRAIN_BATCH_SIZE" \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$PPO_TOKEN_BUDGET" \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="$PPO_TOKEN_BUDGET" \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$PPO_TOKEN_BUDGET" \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
     actor_rollout_ref.rollout.dtype=bfloat16 \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.use_kl_loss=True \
@@ -212,12 +202,8 @@ exec python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.tensor_model_parallel_size="$ROLLOUT_TP_SIZE" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
-    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
-    actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
     actor_rollout_ref.rollout.max_model_len=8192 \
     actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
-    actor_rollout_ref.rollout.max_num_seqs="$ROLLOUT_MAX_NUM_SEQS" \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.critic_warmup=0 \
@@ -227,7 +213,6 @@ exec python -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=$NGPUS_PER_NODE \
     trainer.nnodes=$NNODES \
     trainer.test_freq=-1 \
-    trainer.val_at_end=True \
     trainer.default_hdfs_dir=null \
     "trainer.default_local_dir='$PROJ_DIR'" \
     trainer.total_epochs=5 \
@@ -237,4 +222,3 @@ exec python -m verl.trainer.main_ppo \
 
 
 # trainer.resume_mode=resume_path \
-# trainer.val_only=True \

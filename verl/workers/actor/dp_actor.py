@@ -324,18 +324,10 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
-        accumulation_segments = int(data.meta_info.get("accumulation_segments", 1))
-        if accumulation_segments > 1:
-            if self.ulysses_sequence_parallel_size != 1 or not self.config.use_dynamic_bsz:
-                raise ValueError("Segmented accumulation requires SP=1 and dynamic microbatching")
-            if self.config.ppo_epochs != 1 or self.config.train_batch_size != self.config.ppo_mini_batch_size:
-                raise ValueError("Merged tail accumulation requires one PPO optimizer update per step")
         ######
         # ADD: loss mask
         ######
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages", "response_mask"]
-        if accumulation_segments > 1:
-            select_keys.append("accumulation_segment")
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
 
@@ -381,14 +373,7 @@ class DataParallelPPOActor(BasePPOActor):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
                 mini_batch = data
-                if accumulation_segments > 1:
-                    from recurrent.batch_accumulation import iter_segment_microbatches
-                    micro_batches = iter_segment_microbatches(
-                        mini_batch,
-                        segment_count=accumulation_segments,
-                        max_tokens=self.config.ppo_max_token_len_per_gpu,
-                    )
-                elif has_multi_modal_inputs:
+                if has_multi_modal_inputs:
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
                     micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
@@ -419,17 +404,8 @@ class DataParallelPPOActor(BasePPOActor):
                     from warnings import warn
                     warn("Using dynamic bsz is highly recomended for multiturn since there will be padding samples")
                 mini_batch_token_nums = data['response_mask'].sum()
-                if accumulation_segments > 1:
-                    # FSDP averages rank gradients: use a global denominator so
-                    # unequal 8/4 segments and token lengths receive correct weight.
-                    from recurrent.batch_accumulation import global_loss_denominator
-                    accumulation_denominator, accumulation_world_size = global_loss_denominator(
-                        mini_batch, grad_acc_mode(loss_agg_mode=self.config.loss_agg_mode)
-                    )
-                else:
-                    micro_batches = ((micro, False) for micro in micro_batches)
 
-                for data, dummy_microbatch in micro_batches:
+                for data in micro_batches:
                     # Support all hardwares
                     if isinstance(data, DataProto):
                         data = {**data.batch.to(torch.cuda.current_device()), **data.non_tensor_batch}
@@ -486,11 +462,10 @@ class DataParallelPPOActor(BasePPOActor):
                         # Log every microbatch, like pg_loss/ppo_kl below, rather
                         # than silently reporting only the final microbatch.
                         # Reuses the scalar read already present in this path.
-                        if not dummy_microbatch:
-                            append_to_dict(metrics, {
-                                "actor/kl_loss": kl_loss.detach().item(),
-                                "actor/kl_coef": self.config.kl_loss_coef,
-                            })
+                        append_to_dict(metrics, {
+                            "actor/kl_loss": kl_loss.detach().item(),
+                            "actor/kl_coef": self.config.kl_loss_coef,
+                        })
 
                     ######
                     # MODIFY: we have to fix grad_acc computation: weighted averaging by token num in stead of len(data)
@@ -500,14 +475,7 @@ class DataParallelPPOActor(BasePPOActor):
                     #         Since we have a variant of batchsize, we also remove self.gradient_accumulation
                     ######
                     acc_grad_mode = grad_acc_mode(loss_agg_mode)
-                    if accumulation_segments > 1:
-                        from recurrent.batch_accumulation import accumulation_weight
-                        local_weight = len(data) if acc_grad_mode == "seq" else response_mask.sum().item()
-                        loss = policy_loss * accumulation_weight(
-                            local_weight, accumulation_denominator,
-                            accumulation_world_size, dummy=dummy_microbatch,
-                        )
-                    elif acc_grad_mode == "seq":
+                    if acc_grad_mode == "seq":
                         loss = policy_loss * (len(data) / len(mini_batch)) # self.gradient_accumulation
                     elif acc_grad_mode == "token":
                         # weights by token nums, note that we want to apply a simple scalar, or the compute-graph will be extremely large.
@@ -517,8 +485,6 @@ class DataParallelPPOActor(BasePPOActor):
 
 
                     loss.backward()
-                    if dummy_microbatch:
-                        continue
 
                     data = {
                         "actor/pg_loss": pg_loss.detach().item(),
