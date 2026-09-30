@@ -1,5 +1,5 @@
 # WMem
-Learning to Remember with World Models and Predictive Credit Assignment
+WMem: Learning to Remember through World Models of Future Memory States
 
 
 ## Hardware
