@@ -13,6 +13,8 @@ IFS=',' read -ra train_devices <<< "$CUDA_VISIBLE_DEVICES"
 NGPUS_PER_NODE=${#train_devices[@]}
 ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-4}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
+PPO_TOKEN_BUDGET="${PPO_TOKEN_BUDGET:-4096}"
+ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-8}"
 if (( NGPUS_PER_NODE % ROLLOUT_TP_SIZE != 0 || (TRAIN_BATCH_SIZE * 2) % NGPUS_PER_NODE != 0 )); then
     echo 'GPU count must divide batch_size * rollout_n and be divisible by rollout TP size.' >&2
     exit 1
@@ -183,9 +185,9 @@ exec python -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size="$TRAIN_BATCH_SIZE" \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192 \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$PPO_TOKEN_BUDGET" \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="$PPO_TOKEN_BUDGET" \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$PPO_TOKEN_BUDGET" \
     actor_rollout_ref.rollout.dtype=bfloat16 \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.use_kl_loss=True \
@@ -203,6 +205,7 @@ exec python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size="$ROLLOUT_TP_SIZE" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
     actor_rollout_ref.rollout.max_model_len=8192 \
+    actor_rollout_ref.rollout.max_num_seqs="$ROLLOUT_MAX_NUM_SEQS" \
     actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     algorithm.kl_ctrl.kl_coef=0.001 \
