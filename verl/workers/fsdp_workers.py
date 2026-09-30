@@ -505,8 +505,13 @@ class ActorRolloutRefWorker(Worker):
         return self._update_actor(data, prediction_data)
 
     def _update_actor(self, data: DataProto, prediction_data: DataProto = None):
-        # Support all hardwares
-        data = data.to(torch.cuda.current_device())
+        # Keep a merged tail on CPU; the actor transfers only one microbatch.
+        if data.meta_info.get("accumulation_segments", 1) > 1:
+            if self.ulysses_sequence_parallel_size != 1:
+                raise ValueError("Segmented tail accumulation currently requires SP=1")
+            data = data.to("cpu")
+        else:
+            data = data.to(torch.cuda.current_device())
 
         assert self._is_actor
         if self._is_offload_param:

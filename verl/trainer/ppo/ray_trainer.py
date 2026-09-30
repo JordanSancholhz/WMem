@@ -1221,7 +1221,23 @@ class RayPPOTrainer:
                             # Also, just as what happened in validate, we will always set n=1 in generation_kwargs.
                             batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                             gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                            gen_batch_output, final_mask, sample_index = self.generation_manager.run_llm_loop(gen_batch, timing_raw)
+                            # Generate the regular questions first, then the merged tail,
+                            # without changing policy parameters between the two parts.
+                            from recurrent.batch_accumulation import run_segmented_rollout
+                            rollout_limit = (
+                                self.config.data.train_batch_size
+                                * self.config.actor_rollout_ref.rollout.n
+                            )
+                            gen_batch_output, final_mask, sample_index = run_segmented_rollout(
+                                self.generation_manager, gen_batch, timing_raw, rollout_limit
+                            )
+                            if len(gen_batch) > rollout_limit:
+                                gen_batch_output.batch["accumulation_segment"] = (
+                                    sample_index // rollout_limit
+                                )
+                                gen_batch_output.meta_info["accumulation_segments"] = (
+                                    (len(gen_batch) + rollout_limit - 1) // rollout_limit
+                                )
 
                             assert final_mask.sum().item() == len(batch.batch), \
                                 "The number of final responses should be equal to the number of prompts." \
