@@ -33,7 +33,6 @@ import torch
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, RandomSampler, SequentialSampler
-from verl.utils.dataset.tail_batch_sampler import TailMergeBatchSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
@@ -504,13 +503,19 @@ class RayPPOTrainer:
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
 
+        self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
+                                                   batch_size=self.config.data.train_batch_size,
+                                                   num_workers=8,
+                                                   drop_last=True,
+                                                   collate_fn=collate_fn,
+                                                   sampler=sampler)
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_sampler=TailMergeBatchSampler(
-                sampler, self.config.data.get("gen_batch_size") or self.config.data.train_batch_size
-            ),
+            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
             num_workers=8,
+            drop_last=True,
             collate_fn=collate_fn,
+            sampler=sampler,
         )
 
         assert len(self.train_dataloader) >= 1
@@ -903,14 +908,6 @@ class RayPPOTrainer:
                 prediction_batch = None
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
-                metrics["training/questions_in_batch"] = len(batch)
-                # Keep the configured optimizer-step count even for a merged tail.
-                # Recurrent actor td_split consumes ALL rows; dynamic microbatches
-                # accumulate their losses before the single default optimizer step.
-                metrics["training/optimizer_minibatches"] = (
-                    self.config.data.train_batch_size
-                    // self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-                )
                 # pop those keys for generation
                 if "multi_modal_inputs" in batch.non_tensor_batch.keys():
                     gen_batch = batch.pop(
@@ -979,23 +976,7 @@ class RayPPOTrainer:
                             # Also, just as what happened in validate, we will always set n=1 in generation_kwargs.
                             batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                             gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                            # Generate the regular questions first, then the merged tail,
-                            # without changing policy parameters between the two parts.
-                            from recurrent.batch_accumulation import run_segmented_rollout
-                            rollout_limit = (
-                                self.config.data.train_batch_size
-                                * self.config.actor_rollout_ref.rollout.n
-                            )
-                            gen_batch_output, final_mask, sample_index = run_segmented_rollout(
-                                self.generation_manager, gen_batch, timing_raw, rollout_limit
-                            )
-                            if len(gen_batch) > rollout_limit:
-                                gen_batch_output.batch["accumulation_segment"] = (
-                                    sample_index // rollout_limit
-                                )
-                                gen_batch_output.meta_info["accumulation_segments"] = (
-                                    (len(gen_batch) + rollout_limit - 1) // rollout_limit
-                                )
+                            gen_batch_output, final_mask, sample_index = self.generation_manager.run_llm_loop(gen_batch, timing_raw)
 
                             assert final_mask.sum().item() == len(batch.batch), \
                                 "The number of final responses should be equal to the number of prompts." \
